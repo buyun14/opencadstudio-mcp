@@ -125,6 +125,9 @@ action name=text_commit
 - `skipped = 0`（预览器里没有画不出来的实体）
 - `ocads_preview` 返回 `drawn` ≈ `entities`
 - 要交付实体的场合：`engine="mcp"` 跑一遍，用 `measurements`（面积/长度/闭合）核对，再用 `ocads_capture` 出原厂渲染图
+- 多轮迭代时给截图带 `if_changed=True`：画面没变就只回 `changed=false` + `reuse_previous`，
+  别把同一张图反复读进上下文（省 token）；注意它是**逐格墨迹占比**比较，
+  `threshold=0` 也不代表"任何像素差异都算变"（单格要先超过 `tile_eps`）
 - 合图形状对得上：先画一眼轮廓、看出问题再补细节，**每轮都出图**，别盲改坐标
 
 ## 5. 工具清单
@@ -134,7 +137,8 @@ action name=text_commit
 | `ocads_info` | 环境自检 | — |
 | `ocads_run` | 跑命令、存图 | `commands[]`、`open_path`、`save_path` |
 | `ocads_read` | 回读校验 | `op` = entities/records/query/intersections/near/layers/header/capabilities；**`measure` 需 `engine="mcp"`** |
-| `ocads_capture` | **原厂渲染**截图 | `png_path`、`commands`/`dxf_path`、`target`、`zoom` |
+| `ocads_capture` | **原厂渲染**截图 | `png_path`、`commands`/`dxf_path`、`target`、`view`、`if_changed`+`threshold` |
+| `ocads_set_view` | 切视图（`home`/`extents`） | `name` |
 | `ocads_set_properties` | 真改实体属性（线上色/换图层） | `handle` + `updates=[{"path":"/common/color","value":"Red"}]` |
 | `ocads_export` | 无头转格式 | `src`、`dst`（只 `.dwg/.dxf`） |
 | `ocads_preview` | DXF → PNG | `dxf_path`、`png_path`、`scale`、`colors` |

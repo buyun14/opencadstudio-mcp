@@ -25,7 +25,12 @@ class McpProtocolTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.proc.stdin.close()          # type: ignore[union-attr]
+        for handle in (cls.proc.stdin, cls.proc.stdout, cls.proc.stderr):
+            try:
+                if handle and not handle.closed:
+                    handle.close()
+            except Exception:  # noqa: BLE001
+                pass
         try:
             cls.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -56,8 +61,10 @@ class McpProtocolTest(unittest.TestCase):
     def test_tools_list_给出全部工具且_schema_完整(self):
         tools = self.rpc("tools/list")["result"]["tools"]
         names = [t["name"] for t in tools]
-        self.assertEqual(names, ["ocads_info", "ocads_run", "ocads_read", "ocads_export",
-                                 "ocads_capture", "ocads_set_properties", "ocads_preview"])
+        # 顺序不重要，别把断言写脆
+        self.assertEqual(sorted(names), sorted(["ocads_info", "ocads_run", "ocads_read", "ocads_export",
+                                                "ocads_capture", "ocads_set_view", "ocads_set_properties",
+                                                "ocads_preview"]))
         for t in tools:
             self.assertIn("description", t)
             self.assertEqual(t["inputSchema"]["type"], "object")

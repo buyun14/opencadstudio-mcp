@@ -91,7 +91,8 @@ print(tools.preview("/tmp/box.dxf", "/tmp/box.png", colors={"CIRCLE": "red"}))
 | `ocads_run` | 跑一批完整命令（`engine` 可选 serve/mcp）→ 可存 DXF/DWG、可顺手截图，返回实体统计、失败与空转清单 |
 | `ocads_read` | `entities` / `records` / `query` / `intersections` / `near` / `layers` / `header` / `capabilities`；`measure` 需 `engine="mcp"` |
 | `ocads_export` | 一次性无头格式转换（只 `.dwg`/`.dxf`） |
-| `ocads_capture` | **原厂渲染**截图（mcp 引擎 + `ocs_capture`，截图前自动 `zoom_extents`） |
+| `ocads_capture` | **原厂渲染**截图（mcp 引擎 + `ocs_capture`，截图前自动 `view_home`/`zoom_extents`；`if_changed` 可省 token） |
+| `ocads_set_view` | 切视图：`home` / `extents`（上游只有这两个动作） |
 | `ocads_set_properties` | 真改实体属性（线上色 / 换图层），只有 mcp 引擎能做 |
 | `ocads_preview` | DXF → PNG（自带 Pillow 渲染器，读文件本身，零外部依赖） |
 
@@ -103,12 +104,33 @@ print(tools.preview("/tmp/box.dxf", "/tmp/box.png", colors={"CIRCLE": "red"}))
 ocads/client.py      --serve 通道封装（stdio / tcp、会话、错误不再静默）
 ocads/mcp_client.py  上游 GUI MCP 通道（弹窗白名单关闭、document_id 路由、量测、原厂截图）
 ocads/dxf.py         DXF 解析 + Pillow 渲染（含 bulge、椭圆、样条插值、图层色）
+ocads/fingerprint.py 截图指纹去重（if_changed 的底座：逐格墨迹占比，不丢细线）
 ocads/tools.py       工具层（路径沙箱、语法守卫、引擎切换、7 个工具、schema）
 mcp_server.py        stdio MCP server（零第三方依赖）
 skills/opencadstudio/SKILL.md   知识层：引擎选择 + 命令语义 + 坑 + 闭环流程
 examples/otter_draw.py          示例：画一只海獭并出图
 tests/                          unittest（无需 pytest）
 ```
+
+## 省 token 的截图（`if_changed`）
+
+改图是"改 → 截图 → 看 → 再改"的循环，**很多轮之间画面根本没变**，重复塞同一张图很贵
+（一张 1600px 视口 ≈ 一两千 token）。带 `if_changed=True` 时：
+
+```python
+r = tools.capture("/tmp/v.png", commands=[...], if_changed=True)      # 首次：baseline
+r = tools.capture("/tmp/v.png", commands=[...], if_changed=True)      # 画面没变
+# -> {"changed": False, "ratio": 0.0, "reuse_previous": "/tmp/v.png",
+#     "note": "画面与上次实质相同；图已覆盖为当前帧，无需再看"}
+```
+
+实现要点（这点反直觉）：**逐格数像素，不要算平均**。1px 细线在 1600px 图上平均下来接近 0，
+用平均值会把"多了一根线"漏判。所以先把图阈值化成墨迹掩码，再用 BOX 缩放把 0/1 掩码平均成
+"每格墨迹占比"——既不丢细线，又是 C 级速度。
+
+两条稳妥性设计：指纹按 `source`（文档 + 命令 + 视图）区分，换了来源一律重算基线，避免
+"同路径不同内容长得像 → 误判没变"；**只在首次或有变化时更新基线**，否则一串低于阈值的微改
+会让基线越漂越远，最后和调用方真正看过的画面脱节。
 
 ## 原生无头实测清单（都是真跑出来的，不是推测）
 

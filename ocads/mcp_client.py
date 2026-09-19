@@ -331,16 +331,32 @@ class UpstreamMCP:
                          parameters={"collection": "entities"})
         return sum(1 for e in recs.get("records", []) if e.get("type") == entity_type)
 
+    def action(self, name: str, document: Any = None, *, session: str, **fields: Any) -> dict:
+        """透传一个控制面 action（``toggle_grid`` / ``close_document`` / ``pointer_press`` …）。"""
+        return self.call("action", session=session, document=document, name=name, **fields)
+
+    def set_view(self, name: str, document: Any, *, session: str) -> dict:
+        """切视图：``home`` → ``view_home``；``extents`` → ``zoom_extents``。
+
+        上游只有这两个视图动作，没有"顶视/前视/等轴测"的标准面动作；那两个得点 ViewCube
+        （``pointer_press``/``pointer_release``，坐标跟窗口尺寸绑定，脆）。
+        """
+        action = {"home": "view_home", "extents": "zoom_extents"}.get(name)
+        if action is None:
+            raise MCPError(f"未知视图 {name!r}；只有 home / extents")
+        res = self.call("action", session=session, document=document, name=action)
+        if res.get("status") == "waiting_input":
+            # zoom_extents 走交互式 ZOOM，会停在 waiting_input 但视图已经变了
+            self.call("cancel", session=session, document=document)
+        return res
+
     def zoom_extents(self, document: Any, *, session: str) -> dict:
         """缩放到图形范围。
 
         上游的 ``zoom_extents`` 是个 action（走交互式 ZOOM），实测会回 ``waiting_input``
         但**视图已经变了**，所以这里不把 waiting_input 当失败。
         """
-        res = self.call("action", session=session, document=document, name="zoom_extents")
-        if res.get("status") == "waiting_input":
-            self.call("cancel", session=session, document=document)
-        return res
+        return self.set_view("extents", document, session=session)
 
     def capture(self, out_png: str, document: Any, *, session: str, target: str = "viewport",
                 max_size: int = 1600, zoom: bool = True) -> dict:

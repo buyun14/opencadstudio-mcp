@@ -116,6 +116,11 @@ class HeadlessTest(unittest.TestCase):
         with self.assertRaises(tools.ToolError):
             tools.export(self.dxf, os.path.join(self.tmp.name, "t.pdf"))
 
+    def test_视图名校验在起进程之前(self):
+        res = tools.call_tool("ocads_set_view", {"name": "isometric"})
+        self.assertFalse(res["ok"])
+        self.assertIn("home/extents", res["error"])
+
     def test_未知工具报错(self):
         self.assertEqual(tools.call_tool("ocads_nope", {})["ok"], False)
 

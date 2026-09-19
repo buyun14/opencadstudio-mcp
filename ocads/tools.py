@@ -13,11 +13,12 @@ from typing import Any, Iterable
 
 from . import client as _client
 from . import dxf as _dxf
+from . import fingerprint as _fp
 from . import mcp_client as _mcp
 
 __all__ = ["ToolError", "info", "run_commands", "read_document", "export",
-           "preview", "capture", "set_properties", "syntax_guard", "resolve_path",
-           "NAMED_COLORS", "ENGINES"]
+           "preview", "capture", "set_properties", "set_view", "syntax_guard",
+           "resolve_path", "NAMED_COLORS", "ENGINES"]
 
 #: 两条通道：``serve`` = 无头快通道（无窗口、快、缺量测/截图/交互命令）
 #: ``mcp`` = 上游 GUI MCP（Xvfb 下可用，有量测、原厂渲染、交互步骤）
@@ -245,7 +246,8 @@ def export(src: str, dst: str, *, timeout: float = 180.0) -> dict[str, Any]:
 # ------------------------------------------------------------------ 预览（看图）
 def preview(dxf_path: str, png_path: str | None = None, *, scale: float = 8.0,
             line_width: float = 1.1, supersample: int = 3,
-            colors: dict[str, Any] | None = None) -> dict[str, Any]:
+            colors: dict[str, Any] | None = None, if_changed: bool = False,
+            threshold: float = 0.005) -> dict[str, Any]:
     """把 DXF 渲染成 PNG（渲染的是文件本身，可当验真手段）。"""
     src = resolve_path(dxf_path, must_exist=True)
     dst = resolve_path(png_path or (os.path.splitext(src)[0] + "_preview.png"))
@@ -263,13 +265,21 @@ def preview(dxf_path: str, png_path: str | None = None, *, scale: float = 8.0,
                 palette[key] = named
         else:
             palette[key] = int(value)
-    return _dxf.render(src, dst, scale=scale, line_width=line_width,
-                       supersample=supersample, colors=palette or None)
+    out = _dxf.render(src, dst, scale=scale, line_width=line_width,
+                      supersample=supersample, colors=palette or None)
+    try:
+        stamp = os.path.getmtime(src)
+    except OSError:
+        stamp = 0
+    source = f"render:{src}:{stamp}:{scale}:{line_width}:{sorted(palette.items())}"
+    out.update(_fingerprint(dst, if_changed=if_changed, threshold=threshold, source=source))
+    return out
 
 
 # ------------------------------------------------------------------ 原厂渲染截图
 def capture(png_path: str, *, commands: Iterable[str] | None = None, dxf_path: str | None = None,
             target: str = "viewport", max_size: int = 1600, zoom: bool = True,
+            view: str | None = None, if_changed: bool = False, threshold: float = 0.005,
             timeout: float = 300.0) -> dict[str, Any]:
     """用 **OpenCADStudio 自己的渲染器**出图（区别于 ``preview`` 的自绘渲染器）。
 
@@ -285,13 +295,37 @@ def capture(png_path: str, *, commands: Iterable[str] | None = None, dxf_path: s
             m.call("open", session=sid, document=did,
                    path=resolve_path(dxf_path, must_exist=True))
         ran = m.run_many(cmds, did, session=sid) if cmds else {"ok": 0, "failed": [], "no_op": []}
-        shot = m.capture(dst, did, session=sid, target=target, max_size=max_size, zoom=zoom)
-        return {**shot, "engine": "mcp", "document": did, "entities": len(m.handles(did, session=sid)),
-                "failed": ran["failed"], "no_op": ran["no_op"],
-                "modals_closed": prep["modals"]["closed"], "modal_left": prep["modals"]["left"]}
+        if view:
+            m.set_view(view, did, session=sid)      # 画完再定视图，取景才对得上
+        shot = m.capture(dst, did, session=sid, target=target, max_size=max_size,
+                         zoom=zoom and view not in ("home", "extents"))
+        out = {**shot, "engine": "mcp", "document": did,
+               "entities": len(m.handles(did, session=sid)),
+               "failed": ran["failed"], "no_op": ran["no_op"],
+               "modals_closed": prep["modals"]["closed"], "modal_left": prep["modals"]["left"]}
+        source = f"mcp:{did}:{target}:{max_size}:{view or ''}:{'|'.join(cmds)[:200]}"
+        out.update(_fingerprint(dst, if_changed=if_changed, threshold=threshold, source=source))
+        return out
 
 
 # ------------------------------------------------------------------ 真改属性
+def _fingerprint(dst: str, *, if_changed: bool, threshold: float,
+                 source: str | None) -> dict[str, Any]:
+    """算/比指纹，永不抛错——指纹只是省钱手段，不能把截图本身搞失败。"""
+    if not if_changed:
+        return {}
+    try:
+        res = _fp.check(dst, threshold=threshold, source=source)
+    except _fp.FingerprintError as exc:
+        return {"fingerprint_error": str(exc)}
+    except ImportError as exc:                     # 没装 Pillow
+        return {"fingerprint_error": f"缺 Pillow，跳过去重：{exc}"}
+    if not res["changed"]:
+        res["reuse_previous"] = dst                 # 内容与上次实质相同，不必重复看图
+        res["note"] = "画面与上次实质相同；图已覆盖为当前帧，无需再看"
+    return res
+
+
 def _normalize_update(update: dict[str, Any]) -> dict[str, Any]:
     """把好写好记的值转成上游要的序列化枚举。
 
@@ -336,6 +370,27 @@ def set_properties(handle: str, updates: list[dict[str, Any]], *, collection: st
         prep = m.prepare_document(document=document)
         return m.set_properties(handle, normalized, prep["document"], session=prep["session"],
                                 collection=collection)
+
+
+def set_view(name: str, *, document: Any = None, timeout: float = 120.0) -> dict[str, Any]:
+    """切换视图。``name`` 只支持上游给的两个：
+
+    - ``home``：回到 Home 视图（``action: view_home``，实测回 completed，干净）
+    - ``extents``：缩放到图形范围（``action: zoom_extents``，会回 waiting_input 但已生效，
+      内部会补一发 Esc 收尾）
+
+    想要顶视/前视/等轴测这类**标准面视图**，上游没有对应 action，只能像 ocs-webmcp 那样
+    点 ViewCube 的像素坐标（``pointer_press``/``pointer_release``）—— 坐标跟窗口尺寸绑定，
+    比较脆，这里先不提供。
+    """
+    if name not in ("home", "extents"):
+        raise ToolError(f"view 只能是 home/extents（要标准面视图得点 ViewCube，见文档）：{name!r}")
+    with _mcp.UpstreamMCP(timeout=timeout) as m:
+        prep = m.prepare_document(document=document)
+        sid, did = prep["session"], prep["document"]
+        res = (m.set_view(name, did, session=sid))
+        return {"ok": res.get("status") in ("completed", "ok", "waiting_input"),
+                "status": res.get("status"), "document": did}
 
 
 def tool_schemas() -> list[dict[str, Any]]:
@@ -406,7 +461,10 @@ def tool_schemas() -> list[dict[str, Any]]:
                     "dxf_path": {"type": "string", "description": "可选：先打开的 dxf/dwg（与 commands 二选一或都用）"},
                     "target": {"type": "string", "enum": ["viewport", "window"], "description": "截视口还是整个窗口"},
                     "max_size": {"type": "number", "description": "长边像素上限，默认 1600"},
-                    "zoom": {"type": "boolean", "description": "截图前先缩放到图形范围，默认 true"},
+                    "zoom": {"type": "boolean", "description": "截图前缩放到图形范围，默认 true；指定 view=home/extents 时该项自动让位给 view"},
+                    "view": {"type": "string", "enum": ["home", "extents"], "description": "可选：先切视图（home=Home 视图，extents=缩放到范围）"},
+                    "if_changed": {"type": "boolean", "description": "true 时和上次截图比指纹，没变则返回 changed=false 且复用旧图（省 token）"},
+                    "threshold": {"type": "number", "description": "允许变化的格子占比，默认 0.005"},
                 },
                 "required": ["png_path"],
             },
@@ -426,6 +484,19 @@ def tool_schemas() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "ocads_set_view",
+            "description": ("切视图：home（Home 视图）/ extents（缩放到图形范围）。上游只有这两个视图动作，"
+                            "没有顶视/前视/等轴测这类标准面视图（那要点 ViewCube，坐标跟窗口尺寸绑定）。"),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "enum": ["home", "extents"]},
+                    "document": {"description": "可选：目标 document_id"},
+                },
+                "required": ["name"],
+            },
+        },
+        {
             "name": "ocads_preview",
             "description": "把 DXF 渲染成 PNG（自带渲染器，读文件本身，可当验收手段）。colors 可按实体类型或图层名指定颜色，如 {\"SPLINE\":\"red\",\"WATER\":\"blue\"}。",
             "inputSchema": {
@@ -436,6 +507,8 @@ def tool_schemas() -> list[dict[str, Any]]:
                     "scale": {"type": "number", "description": "每单位多少像素，默认 8"},
                     "line_width": {"type": "number", "description": "线宽（单位），默认 1.1"},
                     "colors": {"type": "object", "description": "类型/图层 → ACI 索引或颜色名"},
+                    "if_changed": {"type": "boolean", "description": "true 时比指纹，没变则 changed=false + reuse_previous"},
+                    "threshold": {"type": "number", "description": "允许变化的格子占比，默认 0.005"},
                 },
                 "required": ["dxf_path"],
             },
@@ -462,7 +535,11 @@ def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, A
             return capture(args["png_path"], commands=args.get("commands"),
                            dxf_path=args.get("dxf_path"), target=args.get("target", "viewport"),
                            max_size=int(args.get("max_size", 1600)),
-                           zoom=bool(args.get("zoom", True)))
+                           zoom=bool(args.get("zoom", True)), view=args.get("view"),
+                           if_changed=bool(args.get("if_changed", False)),
+                           threshold=float(args.get("threshold", 0.005)))
+        if name == "ocads_set_view":
+            return set_view(args["name"], document=args.get("document"))
         if name == "ocads_set_properties":
             return set_properties(args["handle"], args["updates"],
                                   collection=args.get("collection", "entities"),
@@ -472,8 +549,11 @@ def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, A
         if name == "ocads_preview":
             return preview(args["dxf_path"], args.get("png_path"), scale=float(args.get("scale", 8.0)),
                            line_width=float(args.get("line_width", 1.1)),
-                           colors=args.get("colors"))
-    except (ToolError, _client.ServeError, _dxf.DxfError, KeyError) as exc:
+                           colors=args.get("colors"),
+                           if_changed=bool(args.get("if_changed", False)),
+                           threshold=float(args.get("threshold", 0.005)))
+    except (ToolError, _client.ServeError, _dxf.DxfError, _fp.FingerprintError,
+            ImportError, KeyError) as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     return {"ok": False, "error": f"未知工具：{name}"}
 
