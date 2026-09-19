@@ -13,9 +13,15 @@ from typing import Any, Iterable
 
 from . import client as _client
 from . import dxf as _dxf
+from . import mcp_client as _mcp
 
 __all__ = ["ToolError", "info", "run_commands", "read_document", "export",
-           "preview", "syntax_guard", "resolve_path", "NAMED_COLORS"]
+           "preview", "capture", "set_properties", "syntax_guard", "resolve_path",
+           "NAMED_COLORS", "ENGINES"]
+
+#: 两条通道：``serve`` = 无头快通道（无窗口、快、缺量测/截图/交互命令）
+#: ``mcp`` = 上游 GUI MCP（Xvfb 下可用，有量测、原厂渲染、交互步骤）
+ENGINES = ("serve", "mcp")
 
 #: 无头 ``run`` 里被静默忽略的命令（实测：返回 completed 但 added=0）
 HEADLESS_NOOP = ("TEXT", "MTEXT", "HATCH", "BHATCH", "POLYGON", "-HATCH")
@@ -80,16 +86,26 @@ def syntax_guard(commands: Iterable[str]) -> list[str]:
 
 
 def run_commands(commands: Iterable[str], *, open_path: str | None = None,
-                 save_path: str | None = None, timeout: float = 300.0) -> dict[str, Any]:
-    """在一个会话里跑一批命令，可选打开/保存。
+                 save_path: str | None = None, engine: str = "serve",
+                 capture_png: str | None = None, timeout: float = 300.0) -> dict[str, Any]:
+    """在一个会话里跑一批命令，可选打开/保存/顺带截图。
 
-    返回 ``{"commands": n, "results": [...], "summary": {...}, "saved": path?}``，
-    任一命令失败会带上 ``failed`` 列表（不静默吞掉）。
+    ``engine="serve"``：无头快通道；``engine="mcp"``：上游 GUI MCP（能截图、能量测、
+    能用需要交互步骤的命令，但慢一些，且要 xvfb 或 DISPLAY）。
+
+    返回 ``{"commands","added","failed","no_op","summary","results",…}``，
+    失败与空转命令都会点名，不静默吞掉。
     """
     cmds = [c for c in (commands or []) if str(c).strip()]
     if not cmds and not open_path:
         raise ToolError("既没有命令也没有要打开的文件")
+    engine = (engine or "serve").lower()
+    if engine not in ENGINES:
+        raise ToolError(f"engine 只能是 {'/'.join(ENGINES)}")
     warnings = syntax_guard(cmds)
+    if engine == "mcp":
+        return _run_via_mcp(cmds, open_path=open_path, save_path=save_path,
+                            capture_png=capture_png, warnings=warnings, timeout=timeout)
 
     with _client.ServeSession(timeout=timeout) as sess:
         if open_path:
@@ -122,22 +138,39 @@ def run_commands(commands: Iterable[str], *, open_path: str | None = None,
 
 # ------------------------------------------------------------------ 读 / 验真
 def read_document(op: str = "entities", *, open_path: str | None = None,
-                  parameters: dict[str, Any] | None = None,
+                  parameters: dict[str, Any] | None = None, engine: str = "serve",
                   timeout: float = 120.0) -> dict[str, Any]:
-    """读图纸：entities / records / query / intersections / near / layers / header / capabilities。
+    """读图纸。
 
-    注意：面积、长度这类 ``measure`` 只在 GUI MCP 里有，无头 ``--serve`` 不提供。
-    无头能做内核验真的是 ``intersections``（真交点+参数）和 ``near``（最近实体+距离）。
+    ``serve`` 引擎：entities / records / query / intersections / near / layers / header /
+    capabilities（``query`` 支持 type/layer/handles/near/contains_point/bounds/detail）。
+    ``mcp`` 引擎：以上读操作 + **measure**（内核算长度/面积/包围盒/质量特性）。
+
+    ``measure`` 只在 mcp 引擎可用——``--serve`` 没有这个 op，会明确报错而不是返回空。
     """
     op = (op or "entities").strip()
     params = dict(parameters or {})
-    known = ("entities", "layers", "header", "capabilities", "records", "query",
-             "intersections", "near")
+    engine = (engine or "serve").lower()
+    if engine not in ENGINES:
+        raise ToolError(f"engine 只能是 {'/'.join(ENGINES)}")
+    serve_ops = ("entities", "layers", "header", "capabilities", "records", "query",
+                 "intersections", "near")
+    if op not in serve_ops and op != "measure":
+        raise ToolError(f"不支持的 op：{op}（可用 {'/'.join(serve_ops)}/measure）")
     if op == "measure":
-        raise ToolError("无头 --serve 没有 measure（面积/长度）这个 op，那是 GUI MCP 专属；"
-                        "改用 intersections / near / query(detail='full') 做内核验真")
-    if op not in known:
-        raise ToolError(f"不支持的 op：{op}（可用 {'/'.join(known)}）")
+        if engine != "mcp":
+            raise ToolError("measure（面积/长度）只有 GUI MCP 引擎有："
+                            "传 engine='mcp' 再试；--serve 引擎可改用 intersections / near")
+        limit = int(params.get("limit") or 20)
+        with _mcp.UpstreamMCP(timeout=timeout) as m:
+            prep = m.prepare_document(document=params.get("document"))
+            if open_path:
+                m.call("open", session=prep["session"], document=prep["document"],
+                       path=resolve_path(open_path, must_exist=True))
+            handles = params.get("handles") or m.handles(prep["document"], session=prep["session"])[:limit]
+            if not handles:
+                raise ToolError("这份图纸里没有可量测的实体（measure 需要 handles，或先 open_path）")
+            return m.measure(handles, prep["document"], session=prep["session"])
     with _client.ServeSession(timeout=timeout) as sess:
         if open_path:
             sess.open(resolve_path(open_path, must_exist=True))
@@ -161,6 +194,37 @@ def read_document(op: str = "entities", *, open_path: str | None = None,
             extra = {k: v for k, v in params.items() if k not in ("point", "near")}
             return sess.near(float(point[0]), float(point[1]), **extra)
         raise ToolError(f"不支持的 op：{op}")
+
+
+def _run_via_mcp(cmds: list[str], *, open_path: str | None, save_path: str | None,
+                capture_png: str | None, warnings: list[str], timeout: float) -> dict[str, Any]:
+    """走上游 GUI MCP 跑命令（顺带清弹窗、可选截图）。"""
+    with _mcp.UpstreamMCP(timeout=timeout) as m:
+        prep = m.prepare_document()
+        sid, did = prep["session"], prep["document"]
+        if open_path:
+            m.call("open", session=sid, document=did,
+                   path=resolve_path(open_path, must_exist=True))
+        res = m.run_many(cmds, did, session=sid)
+        handles = m.handles(did, session=sid)
+        out: dict[str, Any] = {"engine": "mcp", "commands": len(cmds), "added": res["ok"],
+                               "failed": res["failed"], "no_op": res["no_op"],
+                               "waiting_input": res.get("waiting_input"),
+                               "warnings": warnings, "modals_closed": prep["modals"]["closed"],
+                               "modal_left": prep["modals"]["left"], "entities": len(handles),
+                               "handles": handles, "document": did}
+        if handles:
+            try:
+                out["measurements"] = m.measure(handles[:20], did, session=sid)
+            except _mcp.MCPError as exc:
+                out["measure_error"] = str(exc)
+        if capture_png:
+            out["capture"] = m.capture(resolve_path(capture_png), did, session=sid)
+        if save_path:
+            target = resolve_path(save_path)
+            m.save(target, did, session=sid)
+            out["saved"] = target
+        return out
 
 
 # ------------------------------------------------------------------ 导出
@@ -203,6 +267,77 @@ def preview(dxf_path: str, png_path: str | None = None, *, scale: float = 8.0,
                        supersample=supersample, colors=palette or None)
 
 
+# ------------------------------------------------------------------ 原厂渲染截图
+def capture(png_path: str, *, commands: Iterable[str] | None = None, dxf_path: str | None = None,
+            target: str = "viewport", max_size: int = 1600, zoom: bool = True,
+            timeout: float = 300.0) -> dict[str, Any]:
+    """用 **OpenCADStudio 自己的渲染器**出图（区别于 ``preview`` 的自绘渲染器）。
+
+    在一个 GUI MCP 会话里：清弹窗 → 新建（或打开 ``dxf_path``）→ 跑 ``commands`` → 截图。
+    需要 xvfb 或 DISPLAY；软件渲染（llvmpipe）下画面里可能叠着 GPU 警告弹窗。
+    """
+    dst = resolve_path(png_path)
+    cmds = [c for c in (commands or []) if str(c).strip()]
+    with _mcp.UpstreamMCP(timeout=timeout) as m:
+        prep = m.prepare_document()
+        sid, did = prep["session"], prep["document"]
+        if dxf_path:
+            m.call("open", session=sid, document=did,
+                   path=resolve_path(dxf_path, must_exist=True))
+        ran = m.run_many(cmds, did, session=sid) if cmds else {"ok": 0, "failed": [], "no_op": []}
+        shot = m.capture(dst, did, session=sid, target=target, max_size=max_size, zoom=zoom)
+        return {**shot, "engine": "mcp", "document": did, "entities": len(m.handles(did, session=sid)),
+                "failed": ran["failed"], "no_op": ran["no_op"],
+                "modals_closed": prep["modals"]["closed"], "modal_left": prep["modals"]["left"]}
+
+
+# ------------------------------------------------------------------ 真改属性
+def _normalize_update(update: dict[str, Any]) -> dict[str, Any]:
+    """把好写好记的值转成上游要的序列化枚举。
+
+    上游的 ``/common/color`` 要 ``{"Index": 1}`` 或 ``"ByLayer"``，
+    直接给 ``"Red"``/``1`` 会回 ``invalid_value``（实测）。
+    """
+    if not isinstance(update, dict) or "path" not in update:
+        raise ToolError(f"updates 里每项都要有 path：{update!r}")
+    out = dict(update)
+    path = str(out["path"])
+    value = out.get("value")
+    if path.endswith("/color"):
+        if isinstance(value, bool):
+            raise ToolError("颜色别给布尔值")
+        if isinstance(value, (int, float)):
+            out["value"] = {"Index": int(value)}
+        elif isinstance(value, str):
+            named = NAMED_COLORS.get(value.strip().lower())
+            if named is not None:
+                out["value"] = {"Index": named}
+            elif value in ("ByLayer", "ByBlock"):
+                out["value"] = value
+            else:
+                raise ToolError(f"颜色 {value!r} 认不出来；可用颜色名（{'/'.join(sorted(NAMED_COLORS))}）"
+                                f"、ACI 索引、或 'ByLayer'/'ByBlock'")
+    return out
+
+
+def set_properties(handle: str, updates: list[dict[str, Any]], *, collection: str = "entities",
+                   document: Any = None, timeout: float = 120.0) -> dict[str, Any]:
+    """改记录属性（实体颜色/图层/线型…）——只有 GUI MCP 引擎能做，改的是图纸数据本身。
+
+    ``updates`` 形如 ``[{"path": "/common/color", "value": "red"}]``（颜色名 / ACI 索引 /
+    ``ByLayer`` 都可以，本函数会转成上游要的序列化枚举）。
+    具体路径与取值域用 ``ocads_read(op="records")`` 读出来对照，或在上游
+    ``record_schema`` 里查（serve 引擎没有这个 op）。
+    """
+    if not handle or not updates:
+        raise ToolError("set_properties 需要 handle 和 updates")
+    normalized = [_normalize_update(u) for u in updates]
+    with _mcp.UpstreamMCP(timeout=timeout) as m:
+        prep = m.prepare_document(document=document)
+        return m.set_properties(handle, normalized, prep["document"], session=prep["session"],
+                                collection=collection)
+
+
 def tool_schemas() -> list[dict[str, Any]]:
     """MCP 工具清单（与 mcp_server.py 共用，保证 schema 只写一处）。"""
     roots = os.pathsep.join(allowed_roots())
@@ -224,6 +359,9 @@ def tool_schemas() -> list[dict[str, Any]]:
                                  "description": "完整命令行，如 'LINE 0,0 10,0'、'PLINE 0,0 10,0 10,10 C'、'ELLIPSE 0,0 40,0 20'、'ARC 0,0 5,5 10,0'、'SPLINE 0,0 20,10 40,0 C'、'DONUT 0 9 0,0'(实心盘)、'CIRCLE 0,0 10'、'RECTANG -5,-5 5,5'"},
                     "open_path": {"type": "string", "description": "可选：先打开这个 dxf/dwg（不给则新建）"},
                     "save_path": {"type": "string", "description": "可选：结束前保存到该路径（.dxf/.dwg）"},
+                    "engine": {"type": "string", "enum": ["serve", "mcp"],
+                               "description": "serve=无头快通道（默认）；mcp=上游 GUI MCP，慢但支持需要交互步骤的命令"},
+                    "capture_png": {"type": "string", "description": "可选：跑完用原厂渲染器截图到该 PNG（隐含 engine=mcp）"},
                 },
                 "required": ["commands"],
             },
@@ -239,7 +377,9 @@ def tool_schemas() -> list[dict[str, Any]]:
                     "op": {"type": "string", "enum": ["entities", "records", "query", "intersections",
                                                       "near", "layers", "header", "capabilities"]},
                     "open_path": {"type": "string", "description": "可选：读这份文件（不给则读空图）"},
-                    "parameters": {"type": "object", "description": "透传参数：records 用 {\"collection\":\"entities\"}；query 用 {\"type\":\"Circle\",\"detail\":\"full\"}；intersections 用 {\"handles\":[\"63\",\"64\"]}；near 用 {\"point\":[0,0]}"},
+                    "parameters": {"type": "object", "description": "透传参数：records→{\"collection\":\"entities\"}；query→{\"type\":\"Circle\",\"detail\":\"full\"}；intersections→{\"handles\":[\"63\",\"64\"]}；near→{\"point\":[0,0]}；measure→{\"handles\":[\"63\"]}"},
+                    "engine": {"type": "string", "enum": ["serve", "mcp"],
+                               "description": "measure 必须用 mcp；其余读操作 serve 即可"},
                 },
                 "required": ["op"],
             },
@@ -251,6 +391,38 @@ def tool_schemas() -> list[dict[str, Any]]:
                 "type": "object",
                 "properties": {"src": {"type": "string"}, "dst": {"type": "string"}},
                 "required": ["src", "dst"],
+            },
+        },
+        {
+            "name": "ocads_capture",
+            "description": ("用 OpenCADStudio **自己的渲染器**出图（不是自绘），需要 xvfb 或 DISPLAY。"
+                            "一个会话里：清启动弹窗 → 新建或打开 dxf_path → 跑 commands → 截图。"
+                            "软件渲染时画面里可能叠着 GPU 警告弹窗。"),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "png_path": {"type": "string", "description": "输出 PNG 路径"},
+                    "commands": {"type": "array", "items": {"type": "string"}, "description": "可选：先画的完整命令"},
+                    "dxf_path": {"type": "string", "description": "可选：先打开的 dxf/dwg（与 commands 二选一或都用）"},
+                    "target": {"type": "string", "enum": ["viewport", "window"], "description": "截视口还是整个窗口"},
+                    "max_size": {"type": "number", "description": "长边像素上限，默认 1600"},
+                    "zoom": {"type": "boolean", "description": "截图前先缩放到图形范围，默认 true"},
+                },
+                "required": ["png_path"],
+            },
+        },
+        {
+            "name": "ocads_set_properties",
+            "description": "改记录属性（实体线上色/换图层），只有 GUI MCP 能做，改的是图纸数据本身。updates 形如 [{\"path\":\"/common/color\",\"value\":\"red\"}]，颜色名/ACI 索引/ByLayer 都会自动转成上游要的形式。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "string", "description": "实体句柄，可从 ocads_read(op='entities') 或 run 返回的 handles 拿"},
+                    "updates": {"type": "array", "items": {"type": "object"}, "description": "[{\"path\":\"/common/color\",\"value\":\"red\"}]"},
+                    "collection": {"type": "string", "description": "records 集合，默认 entities"},
+                    "document": {"description": "可选：目标 document_id"},
+                },
+                "required": ["handle", "updates"],
             },
         },
         {
@@ -279,10 +451,22 @@ def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, A
             return info()
         if name == "ocads_run":
             return run_commands(args.get("commands") or [], open_path=args.get("open_path"),
-                                save_path=args.get("save_path"))
+                                save_path=args.get("save_path"),
+                                engine=args.get("engine") or ("mcp" if args.get("capture_png") else "serve"),
+                                capture_png=args.get("capture_png"))
         if name == "ocads_read":
             return read_document(args.get("op", "entities"), open_path=args.get("open_path"),
-                                 parameters=args.get("parameters"))
+                                 parameters=args.get("parameters"),
+                                 engine=args.get("engine") or "serve")
+        if name == "ocads_capture":
+            return capture(args["png_path"], commands=args.get("commands"),
+                           dxf_path=args.get("dxf_path"), target=args.get("target", "viewport"),
+                           max_size=int(args.get("max_size", 1600)),
+                           zoom=bool(args.get("zoom", True)))
+        if name == "ocads_set_properties":
+            return set_properties(args["handle"], args["updates"],
+                                  collection=args.get("collection", "entities"),
+                                  document=args.get("document"))
         if name == "ocads_export":
             return export(args["src"], args["dst"])
         if name == "ocads_preview":

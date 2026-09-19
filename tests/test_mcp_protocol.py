@@ -53,16 +53,19 @@ class McpProtocolTest(unittest.TestCase):
         res = self.rpc("initialize", {"protocolVersion": "1999-01-01"})["result"]
         self.assertNotEqual(res["protocolVersion"], "1999-01-01")
 
-    def test_tools_list_给出五个工具且_schema_完整(self):
+    def test_tools_list_给出全部工具且_schema_完整(self):
         tools = self.rpc("tools/list")["result"]["tools"]
         names = [t["name"] for t in tools]
-        self.assertEqual(names, ["ocads_info", "ocads_run", "ocads_read",
-                                 "ocads_export", "ocads_preview"])
+        self.assertEqual(names, ["ocads_info", "ocads_run", "ocads_read", "ocads_export",
+                                 "ocads_capture", "ocads_set_properties", "ocads_preview"])
         for t in tools:
             self.assertIn("description", t)
             self.assertEqual(t["inputSchema"]["type"], "object")
         run = next(t for t in tools if t["name"] == "ocads_run")
         self.assertIn("commands", run["inputSchema"]["properties"])
+        self.assertIn("engine", run["inputSchema"]["properties"])
+        cap = next(t for t in tools if t["name"] == "ocads_capture")
+        self.assertIn("png_path", cap["inputSchema"]["required"])
 
     def test_调用工具返回_content_和_structured(self):
         res = self.rpc("tools/call", {"name": "ocads_info", "arguments": {}})["result"]

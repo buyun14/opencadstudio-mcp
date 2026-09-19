@@ -8,19 +8,36 @@ description: 用 OpenCADStudio 生成、校验、导出和预览 CAD 图纸（DX
 把“一句话 → 真 CAD 文件 → 能看能验”这套流程跑通。**核心价值不是画得像，而是能验真**：
 文件是真 DWG/DXF 编解码产物、几何能拿内核量测、命令结果能回读比对。
 
-## 0. 开始前先自检
+## 0. 先选引擎，再开始
+
+| 引擎 | 用什么 | 强项 | 弱项 |
+|---|---|---|---|
+| `serve`（默认） | 上游 `--serve` JSON 行协议 | 快（一次连接跑完整批）、无窗口、稳 | **没有量测**、**没有原厂截图**、TEXT/HATCH 静默 no-op、不支持交互步骤 |
+| `mcp` | 上游 `--mcp`（GUI 控制面，无显示时自动套 `xvfb-run`） | **内核量测**、**原厂渲染截图**、`set_properties` 线上色、`start`/`input` 能做 TEXT/HATCH、FILLET/TRIM 这类交互命令 | 慢一些（每条一个往返）、要 xvfb/DISPLAY |
+
+起步自检：
 
 ```
 ocads_info                     # 或：python3 -m ocads.tools info
 ```
 
-返回里关心的字段：`binary`（二进制路径）、`version`、`headless`（无头通道可用）、
-`roots`（允许写入的目录白名单）。
+返回里关心 `binary` / `version` / `headless` / `roots`。
 
-- `headless=false` → 无头通道起不来，先看 `error`，别继续猜。
-- 二进制缺失 → 设 `OPENCADSTUDIO_BIN` 指到编译产物（本机在
-  `/public/ProjectCollection/2026_9/OpenCADStudio/target/release/OpenCADStudio`）。
+- `headless=false` → `serve` 起不来，先看 `error`，别继续猜。
+- 二进制缺失 → 设 `OPENCADSTUDIO_BIN` 指到编译产物。
 - 写入被拒 → 路径不在 `OCADS_ROOTS` 内，换目录或加环境变量。
+
+### mcp 引擎的三个必知坑（都踩过，实测解法）
+
+1. **启动弹窗会挡住建图**：`AssocPrompt` → `DonationPrompt`，不清掉的话 `{"op":"new"}`
+   返回 ok 却建不出图纸（上游 issue #1349 描述过同一现象）。解法：`{"op":"action",
+   "name":"close_modal"}`（比发 `cancel`/Esc 精准）。本工具只自动关白名单里的
+   `AssocPrompt / DonationPrompt / UpdateNotice / About`，其它弹窗**如实上报不代关**。
+2. **读写都要带 `document_id`**：默认盯"活动标签页"，新建完活动页可能还停在开始页，
+   不带 id 会读到空图纸。
+3. **`waiting_input` 不等于失败**：SPLINE/ARC 这类"还能继续吃输入"的命令、
+   以及 `zoom_extents`，实测都回 `waiting_input` **但实体/视图已经生效**。
+   本工具默认补一发 `cancel`（Esc）收尾并按完成计。
 
 ## 1. 标准闭环（四步，缺一步就等于没做完）
 
@@ -66,11 +83,11 @@ ocads_info                     # 或：python3 -m ocads.tools info
 | 想做的事 | 结论 |
 |---|---|
 | `TEXT` / `MTEXT` / `HATCH` / `POLYGON` | **静默 no-op**：返回 completed 但一个实体都不加。要文字/填充必须走 GUI 或上游 MCP 的 `start`/`step` 交互流 |
-| 面积 / 长度量测（`measure`） | 只有 GUI MCP 有，`--serve` 会直接回 `unknown op: measure`。无头验真改用 `intersections` / `near` / `detail="full"` |
+| 面积 / 长度量测（`measure`） | 只有 mcp 引擎有（`--serve` 回 `unknown op: measure`）。用 `ocads_read(op="measure", engine="mcp", open_path=…)` 或 `ocads_run(engine="mcp")` 返回的 `measurements` |
 | 交互式续行（先 `PLINE` 再一步步给点） | 不支持。`--serve` 每行都是独立完整命令；半截命令**不一定报错**（见下） |
 | 半截命令（缺参数） | 更坑：`LINE 0,0` 是静默不加实体；`CIRCLE 0,0`（缺半径）**照样 added=1**，造出一个退化圆。所以永远别信 `added`，要回读几何 |
-| 无头导出 PNG/PDF | 上游只开了 `.dwg/.dxf`（`pdf_export.rs` 只被 GUI 的 plot/print 调用）→ 用 `ocads_preview` 自绘 |
-| GUI / 上游 `--mcp` | 需要真实窗口；服务器上（含 Xvfb）起不来，`ocs_sessions` 能连但 `new` 建不出图 |
+| 无头导出 PNG/PDF | `--export` 只认 `.dwg/.dxf`。要图：`ocads_capture`（mcp 引擎，**原厂渲染**）或 `ocads_preview`（serve 侧自绘，仅需 Pillow） |
+| GUI / 上游 `--mcp` | ✅ **能用**（无显示时自动 `xvfb-run`）。卡住的原因从来不是"没窗口"，而是启动弹窗没关 + 没带 `document_id`（见上面三条坑） |
 | 硬件加速 | 没独显时会降级软件渲染（llvmpipe），大图慢，别开一堆并发 |
 
 `syntax_guard` 会提前警告第 1 行那类命令，`run_commands` 会把"该出实体却没出"的命令放进
@@ -82,6 +99,7 @@ ocads_info                     # 或：python3 -m ocads.tools info
 - `no_op` 为空（该出实体的命令都出了；空转命令要么解释清楚，要么改写法）
 - `skipped = 0`（预览器里没有画不出来的实体）
 - `ocads_preview` 返回 `drawn` ≈ `entities`
+- 要交付实体的场合：`engine="mcp"` 跑一遍，用 `measurements`（面积/长度/闭合）核对，再用 `ocads_capture` 出原厂渲染图
 - 合图形状对得上：先画一眼轮廓、看出问题再补细节，**每轮都出图**，别盲改坐标
 
 ## 5. 工具清单
@@ -90,13 +108,22 @@ ocads_info                     # 或：python3 -m ocads.tools info
 |---|---|---|
 | `ocads_info` | 环境自检 | — |
 | `ocads_run` | 跑命令、存图 | `commands[]`、`open_path`、`save_path` |
-| `ocads_read` | 回读校验 | `op` = entities/records/query/intersections/near/layers/header/capabilities |
+| `ocads_read` | 回读校验 | `op` = entities/records/query/intersections/near/layers/header/capabilities；**`measure` 需 `engine="mcp"`** |
+| `ocads_capture` | **原厂渲染**截图 | `png_path`、`commands`/`dxf_path`、`target`、`zoom` |
+| `ocads_set_properties` | 真改实体属性（线上色/换图层） | `handle` + `updates=[{"path":"/common/color","value":"Red"}]` |
 | `ocads_export` | 无头转格式 | `src`、`dst`（只 `.dwg/.dxf`） |
 | `ocads_preview` | DXF → PNG | `dxf_path`、`png_path`、`scale`、`colors` |
 
 `colors` 示例：`{"SPLINE":"black","WATER":"blue","Circle":1}` —— 键可以是实体类型或图层名，
 值可以是 ACI 索引或颜色名（black/red/yellow/green/cyan/blue/magenta/gray/orange/…）。
 注意这只影响渲染，不改文件。
+
+## 5.1 同类实践（参考，别重复造）
+
+`helenkwok/ocs-webmcp`（MIT）把上游控制面接到浏览器 WebMCP（24 个工具、人工确认门、
+乐观并发、录制 contact sheet），跑的是 web 版。它验证了同一套控制面在浏览器里的边界，
+也把"只自动关捐赠弹窗、其它弹窗上报"这个更严的安全姿态写实了——本工具照抄了这条。
+差异：它要浏览器 + wasm 构建，我们的 `mcp` 引擎要的是本机二进制（无浏览器）。
 
 ## 6. 安全边界
 
