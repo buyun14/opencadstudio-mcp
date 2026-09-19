@@ -1,0 +1,15 @@
+{
+  "_说明": "把这段并入 AstrBot 的 data/mcp_server.json 数组即可（与现有条目并列）。路径按本机实际情况改。",
+  "name": "opencadstudio",
+  "active": true,
+  "command": "python3",
+  "args": [
+    "/public/ProjectCollection/2026_9/Astr-plugins/opencadstudio-mcp/mcp_server.py"
+  ],
+  "env": {
+    "OPENCADSTUDIO_BIN": "/public/ProjectCollection/2026_9/OpenCADStudio/target/release/OpenCADStudio",
+    "OCADS_ROOTS": "/public/ProjectCollection/2026_9"
+  },
+  "_skill": "再把 skills/opencadstudio/ 复制或软链到 AstrBot/data/skills/opencadstudio/",
+  "_备选_用编译产物直接当只读客户端": "无需任何依赖，只要 python3 + Pillow"
+}
