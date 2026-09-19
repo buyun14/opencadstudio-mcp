@@ -264,6 +264,73 @@ class UpstreamMCP:
         return self.call("set_properties", session=session, document=document,
                          collection=collection, handle=handle, updates=updates)
 
+    # ---------------------------------------------------------------- 交互步骤
+    def start_command(self, cmd: str, document: Any, *, session: str) -> dict:
+        """启动一个交互命令，返回 ``state.command``（含 accepts / options / input_example）。
+
+        这是 ``run`` 做不到的那半：TEXT、HATCH、FILLET、TRIM 这些要一步一步喂输入。
+        """
+        res = self.call("start", session=session, document=document, cmd=cmd)
+        return (res.get("state") or {}).get("command") or {}
+
+    def input_point(self, x: float, y: float, z: float = 0.0, document: Any = None, *,
+                    session: str) -> dict:
+        """给当前交互步骤喂一个点（注意是 ``point: [x,y,z]``，不是 x/y 字段）。"""
+        return self.call("input", session=session, document=document, kind="point",
+                         point=[x, y, z], space="wcs")
+
+    def input_token(self, keyword: str, document: Any = None, *, session: str) -> dict:
+        """喂一个关键字/选项（如对正 ``J``、样式 ``ST``）。
+
+        注意坑：``kind="token"`` 的负载字段名是 **text** 不是 token，
+        写成 ``{"kind":"token","token":"C"}`` 上游会回
+        ``Missing text for input. Example request: {"op":"input","kind":"token","text":"C"}``。
+        """
+        return self.call("input", session=session, document=document, kind="token", text=keyword)
+
+    def input_text(self, text: str, document: Any = None, *, session: str) -> dict:
+        """喂一段自由文本（TEXT/MTEXT 的内容）。"""
+        return self.call("input", session=session, document=document, kind="text", text=text)
+
+    def input_enter(self, document: Any = None, *, session: str) -> dict:
+        """回车（结束当前步骤）。"""
+        return self.call("input", session=session, document=document, kind="enter")
+
+    def add_text(self, text: str, at: tuple[float, float], height: float | None = None,
+                 rotation: float | None = None, *, document: Any = None, session: str) -> dict:
+        """写一行文字（实测可用，六步）。
+
+        ``run`` 在批处理里对 TEXT 是**静默 no-op**，只有这条交互路能建出文字：
+
+        1. ``start`` cmd=TEXT
+        2. ``input`` kind=point ``point=[x,y,0]``（注意是数组，不是 x/y 字段）
+        3. ``input`` kind=text  text="<高度>"   ← 敲数字用 **text**，不是 token
+        4. ``input`` kind=text  text="<旋转角>"
+        5. ``action`` name=text_input value="<内容>"   ← 这一步起是画布内文字编辑器
+        6. ``action`` name=text_commit
+
+        第 4 步之后 ``state.command`` 会变成 null（命令结束了，编辑器开着），
+        所以别拿"还有没有 command"判断成败——看实体里有没有 ``Text``。
+        """
+        self.start_command("TEXT", document, session=session)
+        self.input_point(at[0], at[1], document=document, session=session)
+        for value in (height, rotation):
+            if value is None:
+                self.input_enter(document=document, session=session)
+            else:
+                self.input_text(str(value), document=document, session=session)
+        self.call("action", session=session, document=document, name="text_input", value=text)
+        res = self.call("action", session=session, document=document, name="text_commit")
+        return {"status": res.get("status"),
+                "entities": len(self.handles(document, session=session)),
+                "texts": self.count_type("Text", document, session=session)}
+
+    def count_type(self, entity_type: str, document: Any, *, session: str) -> int:
+        """数某类实体有几个（验收用）。"""
+        recs = self.read("records", session=session, document=document,
+                         parameters={"collection": "entities"})
+        return sum(1 for e in recs.get("records", []) if e.get("type") == entity_type)
+
     def zoom_extents(self, document: Any, *, session: str) -> dict:
         """缩放到图形范围。
 

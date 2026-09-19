@@ -13,7 +13,7 @@ description: 用 OpenCADStudio 生成、校验、导出和预览 CAD 图纸（DX
 | 引擎 | 用什么 | 强项 | 弱项 |
 |---|---|---|---|
 | `serve`（默认） | 上游 `--serve` JSON 行协议 | 快（一次连接跑完整批）、无窗口、稳 | **没有量测**、**没有原厂截图**、TEXT/HATCH 静默 no-op、不支持交互步骤 |
-| `mcp` | 上游 `--mcp`（GUI 控制面，无显示时自动套 `xvfb-run`） | **内核量测**、**原厂渲染截图**、`set_properties` 线上色、`start`/`input` 能做 TEXT/HATCH、FILLET/TRIM 这类交互命令 | 慢一些（每条一个往返）、要 xvfb/DISPLAY |
+| `mcp` | 上游 `--mcp`（GUI 控制面，无显示时自动套 `xvfb-run`） | **内核量测**、**原厂渲染截图**、`set_properties` 线上色、**TEXT 实测可建**（交互步骤）、FILLET/TRIM 这类交互命令 | 慢一些（每条一个往返）、要 xvfb/DISPLAY |
 
 起步自检：
 
@@ -38,6 +38,31 @@ ocads_info                     # 或：python3 -m ocads.tools info
 3. **`waiting_input` 不等于失败**：SPLINE/ARC 这类"还能继续吃输入"的命令、
    以及 `zoom_extents`，实测都回 `waiting_input` **但实体/视图已经生效**。
    本工具默认补一发 `cancel`（Esc）收尾并按完成计。
+
+### 交互步骤的输入协议（实测，踩过才写）
+
+`start` 回 `state.command`，里面 `accepts` / `options` / `prompt` / `input_example` 就是要喂什么：
+
+| 步骤类型 | 怎么喂 | 坑 |
+|---|---|---|
+| 选点 | `{"op":"input","kind":"point","point":[x,y,0],"space":"wcs"}` | **点是数组**，写成 `x`/`y` 字段会回 `Missing point for input` |
+| 敲数字（高度/角度） | `{"op":"input","kind":"text","text":"5"}` | 是 **text** 不是 token；不给就直接 `kind:"enter"` 取默认值 |
+| 关键字（`J`/`ST`/`C`） | `{"op":"input","kind":"token","text":"C"}` | 负载字段名是 **text**，写成 `token` 会回 `Missing text for input` |
+| 回车 | `{"op":"input","kind":"enter"}` | 吃掉默认值 |
+
+**写文字（TEXT）的完整六步**（`run` 做不到，批处理里它是静默 no-op）：
+
+```
+start  cmd=TEXT
+input  kind=point point=[x,y,0]            # 起点
+input  kind=text  text="<高度>"             # 回车则用 kind=enter 取默认
+input  kind=text  text="<旋转角>"
+action name=text_input value="<内容>"       # 这一步之后命令已结束、画布编辑器打开
+action name=text_commit
+```
+
+第 4 步之后 `state.command` 会变成 `null`——**别用"还有没有 command"判断成败**，
+去数实体里有没有 `Text`。本工具封装成 `mcp.add_text(...)`，返回 `texts` 计数。
 
 ## 1. 标准闭环（四步，缺一步就等于没做完）
 
@@ -82,7 +107,7 @@ ocads_info                     # 或：python3 -m ocads.tools info
 
 | 想做的事 | 结论 |
 |---|---|
-| `TEXT` / `MTEXT` / `HATCH` / `POLYGON` | **静默 no-op**：返回 completed 但一个实体都不加。要文字/填充必须走 GUI 或上游 MCP 的 `start`/`step` 交互流 |
+| `TEXT` / `MTEXT` / `HATCH` / `POLYGON`（**serve 引擎**） | **静默 no-op**：返回 completed 但一个实体都不加。要文字就切 mcp 引擎用六步流程（见 §0 末）；HATCH/POLYGON 尚未验证 |
 | 面积 / 长度量测（`measure`） | 只有 mcp 引擎有（`--serve` 回 `unknown op: measure`）。用 `ocads_read(op="measure", engine="mcp", open_path=…)` 或 `ocads_run(engine="mcp")` 返回的 `measurements` |
 | 交互式续行（先 `PLINE` 再一步步给点） | 不支持。`--serve` 每行都是独立完整命令；半截命令**不一定报错**（见下） |
 | 半截命令（缺参数） | 更坑：`LINE 0,0` 是静默不加实体；`CIRCLE 0,0`（缺半径）**照样 added=1**，造出一个退化圆。所以永远别信 `added`，要回读几何 |

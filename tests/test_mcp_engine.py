@@ -63,6 +63,23 @@ class McpEngineTest(unittest.TestCase):
         self.assertAlmostEqual(curve.get("length", 0), 62.83, places=1)   # 2πr
         self.assertTrue(curve.get("closed"))
 
+    def test_文字走交互步骤能建出来(self):
+        # run 的批处理对 TEXT 是静默 no-op，只有 start/input + text_input/text_commit 这条路行
+        with mcp_client.UpstreamMCP(timeout=180) as m:
+            prep = m.prepare_document()
+            sid, did = prep["session"], prep["document"]
+            m.run_many(["CIRCLE 0,0 10"], did, session=sid)
+            out = m.add_text("OCADS", (0, 20), 5.0, 0.0, document=did, session=sid)
+            self.assertEqual(out["texts"], 1, f"文字没建出来：{out}")
+
+    def test_view_home_是可靠的重置视图方式(self):
+        with mcp_client.UpstreamMCP(timeout=180) as m:
+            prep = m.prepare_document()
+            sid, did = prep["session"], prep["document"]
+            m.run_many(["CIRCLE 0,0 10"], did, session=sid)
+            res = m.call("action", session=sid, document=did, name="view_home")
+            self.assertIn(res.get("status"), ("completed", "ok"))
+
     def test_measure_对_serve_引擎要明确报错(self):
         res = tools.call_tool("ocads_read", {"op": "measure", "engine": "serve",
                                              "parameters": {"handles": ["1"]}})

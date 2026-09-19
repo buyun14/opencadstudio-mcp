@@ -14,7 +14,8 @@
 | 速度 | 一次连接跑完整批，快 | 每条命令一个往返，慢一些 |
 | 量测（面积/长度/质量特性） | ❌（`unknown op: measure`） | ✅ 几何核出的真值 |
 | 原厂渲染截图 | ❌ | ✅ `ocads_capture` |
-| TEXT / HATCH / POLYGON | ❌ 静默 no-op | ✅ 走 `start`/`input` 交互步骤 |
+| TEXT | ❌ 静默 no-op | ✅ 实测可建（六步交互流程，封装成 `mcp.add_text`） |
+| 视图重置 | — | ✅ `action: view_home` |
 | 线上色（`set_properties`） | ❌ | ✅ |
 | 自带渲染（Pillow 自绘） | ✅ `ocads_preview` | 不需要 |
 
@@ -108,6 +109,21 @@ skills/opencadstudio/SKILL.md   知识层：引擎选择 + 命令语义 + 坑 + 
 examples/otter_draw.py          示例：画一只海獭并出图
 tests/                          unittest（无需 pytest）
 ```
+
+## 原生无头实测清单（都是真跑出来的，不是推测）
+
+- 启动弹窗 `AssocPrompt` → `DonationPrompt` 会挡住 `{"op":"new"}`（issue #1349 同现象）；
+  用 `{"op":"action","name":"close_modal"}` 关掉即可。
+- 读写都要带 `document_id`；`activate` 可切标签。
+- `waiting_input` ≠ 失败：SPLINE/ARC、`zoom_extents` 都这样，实体/视图已生效；
+  补一发 `cancel`（Esc）就干净收尾。
+- 输入协议：点是 `point:[x,y,z]`；敲数字用 `kind:"text"`；关键字用 `kind:"token"` 且**字段名是 `text`**。
+- TEXT 六步流程可建文字（最后两步是画布编辑器的 `text_input` / `text_commit`）。
+- `measure`（面积/长度/包围盒/质量特性）与 `ocs_capture`（原厂渲染）在原生无头可用。
+- `set_properties` 要带 `collection`，颜色值是序列化枚举 `{"Index": n}` / `"ByLayer"`，
+  给 `"Red"` 会回 `invalid_value`。
+- 需要 `HOME` / `XDG_CONFIG_HOME` 存在，否则报 `No user configuration directory`。
+- 收尾要杀**整个进程组**，否则 `xvfb-run` 派生的 Xvfb 会变孤儿。
 
 ## 参考与致谢
 
