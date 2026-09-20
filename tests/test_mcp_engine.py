@@ -80,12 +80,6 @@ class McpEngineTest(unittest.TestCase):
             res = m.call("action", session=sid, document=did, name="view_home")
             self.assertIn(res.get("status"), ("completed", "ok"))
 
-    def test_measure_对_serve_引擎要明确报错(self):
-        res = tools.call_tool("ocads_read", {"op": "measure", "engine": "serve",
-                                             "parameters": {"handles": ["1"]}})
-        self.assertFalse(res["ok"])
-        self.assertIn("mcp", res["error"])
-
     def test_改属性落在数据上(self):
         with mcp_client.UpstreamMCP(timeout=180) as m:
             prep = m.prepare_document()

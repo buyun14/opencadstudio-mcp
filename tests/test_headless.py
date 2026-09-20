@@ -49,11 +49,18 @@ class HeadlessTest(unittest.TestCase):
         back = tools.read_document("entities", open_path=self.dxf)
         self.assertEqual(back["by_type"], res["summary"])
 
-    def test_提醒无头模式下的静默_no_op(self):
-        res = tools.run_commands(["TEXT 0,0 5 0 hello", "LINE 0,0 1,1"],
-                                 save_path=self.dxf)
-        self.assertTrue(any("TEXT" in w for w in res["warnings"]))
-        self.assertEqual(res["added"], 1)          # TEXT 静默 no-op，只有 LINE 落地了
+    def test_提醒批处理里仍会空转的命令(self):
+        # TEXT 上游已修（旧格式 run 会写进画布编辑器），MTEXT 还需要交互面
+        res = tools.run_commands(["MTEXT 0,0 5 0 hi", "LINE 0,0 1,1"], save_path=self.dxf)
+        self.assertTrue(any("MTEXT" in w for w in res["warnings"]), res["warnings"])
+        self.assertEqual(res["added"], 1, res)      # 只有 LINE 落地
+
+    def test_text_在旧格式_run_里已经能建出来(self):
+        res = tools.run_commands(["TEXT 0,0 5 0 hello"], save_path=self.dxf)
+        self.assertEqual(res["failed"], [], res)
+        self.assertEqual(res["added"], 1, res)
+        back = tools.read_document("entities", open_path=self.dxf)
+        self.assertEqual(back["by_type"].get("Text"), 1, back)
 
     def test_空转命令被标记出来(self):
         # LINE 0,0 缺第二个点：上游返回 completed 但一个实体都不加 → 必须被点名
@@ -84,10 +91,53 @@ class HeadlessTest(unittest.TestCase):
         xs = sorted(round(p["point"][0], 3) for p in hit["intersections"])
         self.assertEqual(xs, [-10.0, 10.0])
 
-    def test_无头没有_measure_要明确报错(self):
-        res = tools.call_tool("ocads_read", {"op": "measure", "open_path": self.dxf})
-        self.assertFalse(res["ok"])
-        self.assertIn("measure", res["error"])
+    def test_serve_引擎也能量测(self):
+        # 2026.38.0 实测：measure 走协议 1（控制面），无头可用
+        tools.run_commands(["CIRCLE 0,0 10"], save_path=self.dxf)
+        res = tools.read_document("measure", open_path=self.dxf, engine="serve")
+        ms = res.get("measurements") or []
+        self.assertTrue(ms, f"没拿到量测：{str(res)[:200]}")
+        self.assertAlmostEqual((ms[0].get("curve") or {}).get("area", 0), 314.16, places=1)
+
+    def test_协议1_能查命令清单(self):
+        res = tools.read_document("commands", parameters={"name": "PLINE"})
+        self.assertIn("PLINE", str(res))
+        self.assertIn("batch", str(res))        # 带批处理写法示例
+
+    def test_协议1_能跑交互步骤写文字(self):
+        with client.ServeSession() as sess:
+            did = sess.new_document()
+            sess.control_must("start", document_id=did, cmd="TEXT")
+            sess.control_must("input", document_id=did, kind="point", point=[0, 0, 0], space="wcs")
+            sess.control_must("input", document_id=did, kind="text", text="5")
+            sess.control_must("input", document_id=did, kind="text", text="0")
+            sess.control_must("action", document_id=did, name="text_input", value="HELLO")
+            sess.control_must("action", document_id=did, name="text_commit")
+            recs = sess.control_must("records", document_id=did, collection="entities")
+            types = [r.get("display_type") for r in recs.get("records", [])]
+            self.assertIn("Text", types, f"文字没建出来：{types}")
+
+    def test_协议1_改图缺document_id会被明确拒绝(self):
+        # 读操作会退回活动标签页，但改图必须点名 document_id
+        with client.ServeSession() as sess:
+            sess.new_document()
+            with self.assertRaises(client.ServeError) as ctx:
+                sess.control_must("run", cmd="CIRCLE 0,0 5")
+            self.assertIn("document_required", str(ctx.exception))
+
+    def test_挂起命令时协议1_回busy而旧格式顶掉(self):
+        with client.ServeSession() as sess:
+            did = sess.new_document()
+            sess.request("run", cmd="LINE")                      # 留一个等待中的命令（run() 会主动报错）
+            with self.assertRaises(client.ServeError) as ctx:
+                sess.control_must("run", document_id=did, cmd="CIRCLE 0,0 5")
+            self.assertIn("command_busy", str(ctx.exception))
+            sess.control_must("cancel", document_id=did)
+            self.assertEqual(sess.run("CIRCLE 0,0 5").get("added"), 1)
+
+    def test_环境自检报告协议1(self):
+        info = tools.info()
+        self.assertTrue(info.get("protocol_1"), f"协议 1 探测失败：{info.get('protocol_1_error')}")
 
     def test_导出_dwg(self):
         tools.run_commands(["CIRCLE 0,0 5"], save_path=self.dxf)

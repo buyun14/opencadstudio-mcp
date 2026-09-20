@@ -12,9 +12,9 @@
 |---|---|---|
 | 上游接口 | `--serve` JSON 行协议 | `--mcp` GUI 控制面（无显示时自动 `xvfb-run`） |
 | 速度 | 一次连接跑完整批，快 | 每条命令一个往返，慢一些 |
-| 量测（面积/长度/质量特性） | ❌（`unknown op: measure`） | ✅ 几何核出的真值 |
+| 量测（面积/长度/质量特性） | ✅ **也能**（协议 1：`measure`，无头可用） | ✅ 几何核出的真值 |
 | 原厂渲染截图 | ❌ | ✅ `ocads_capture` |
-| TEXT | ❌ 静默 no-op | ✅ 实测可建（六步交互流程，封装成 `mcp.add_text`） |
+| TEXT | ✅ 已修（旧格式 `run` 会写进画布编辑器并提交） | ✅ 六步交互流程（封装成 `mcp.add_text`） |
 | 视图重置 | — | ✅ `action: view_home` |
 | 线上色（`set_properties`） | ❌ | ✅ |
 | 自带渲染（Pillow 自绘） | ✅ `ocads_preview` | 不需要 |
@@ -89,7 +89,7 @@ print(tools.preview("/tmp/box.dxf", "/tmp/box.png", colors={"CIRCLE": "red"}))
 |---|---|
 | `ocads_info` | 探测二进制 / 版本 / 无头通道 / 允许目录 |
 | `ocads_run` | 跑一批完整命令（`engine` 可选 serve/mcp）→ 可存 DXF/DWG、可顺手截图，返回实体统计、失败与空转清单 |
-| `ocads_read` | `entities` / `records` / `query` / `intersections` / `near` / `layers` / `header` / `capabilities`；`measure` 需 `engine="mcp"` |
+| `ocads_read` | 旧格式：`entities`/`records`/`query`/`intersections`/`near`/`layers`/`header`/`capabilities`；协议 1：`measure`/`commands`/`properties`/`history`/`state` |
 | `ocads_export` | 一次性无头格式转换（只 `.dwg`/`.dxf`） |
 | `ocads_capture` | **原厂渲染**截图（mcp 引擎 + `ocs_capture`，截图前自动 `view_home`/`zoom_extents`；`if_changed` 可省 token） |
 | `ocads_set_view` | 切视图：`home` / `extents`（上游只有这两个动作） |
@@ -111,6 +111,25 @@ skills/opencadstudio/SKILL.md   知识层：引擎选择 + 命令语义 + 坑 + 
 examples/otter_draw.py          示例：画一只海獭并出图
 tests/                          unittest（无需 pytest）
 ```
+
+## `--serve` 的两条请求格式
+
+上游那个通道其实有**两套请求格式**，这一点我们一开始搞错了（把旧格式的能力当成了全部）：
+
+| | 旧格式 | 协议 1 |
+|---|---|---|
+| 形态 | `{"op":"run","cmd":"…"}` | `{"protocol":1,"request_id":"唯一","document_id":N,"op":"…"}` |
+| 底层 | 精简 op 集 | **控制面本身**（与 `--mcp` 同一套） |
+| 独有能力 | — | `measure`、`commands`（命令清单+批处理写法）、`properties`、`history`、`state`、`start`/`input`/`action` 交互步骤 |
+| 挂起命令时 | 新命令行顶掉它 | 回 `command_busy`，要先 `cancel` |
+| `document_id` | 不需要 | 大多数需要，否则 `document_required` |
+
+我们的客户端两条都支持：`ServeSession.control(...)` / `.measure()` / `.command_manifest()` 走协议 1，
+`ServeSession.run()/entities()/save()` 等仍是旧格式。
+
+## 与上游的关系（2026-09-21）
+
+我们提的修复 **#1392** 和这页对应的 native 文档 **#1401** 都已被上游合入（`OpenCADStudio 2026.38.0` 之后的下一个 release 会带上修复；v2026.38 那个 tag 打在我们合入之前）。维护者还重写了我们那页文档，列出了我们写错的几处——**上游 `docs/automation/native.md` 现在是权威说法**，本仓库的说明以它为准。
 
 ## 省 token 的截图（`if_changed`）
 
@@ -141,7 +160,11 @@ r = tools.capture("/tmp/v.png", commands=[...], if_changed=True)      # 画面�
   补一发 `cancel`（Esc）就干净收尾。
 - 输入协议：点是 `point:[x,y,z]`；敲数字用 `kind:"text"`；关键字用 `kind:"token"` 且**字段名是 `text`**。
 - TEXT 六步流程可建文字（最后两步是画布编辑器的 `text_input` / `text_commit`）。
-- `measure`（面积/长度/包围盒/质量特性）与 `ocs_capture`（原厂渲染）在原生无头可用。
+- `measure`（面积/长度/包围盒/质量特性）走**协议 1**，无头可用；`ocs_capture` 需要窗口，无头下上游回 `gui_required`（所以截图走 mcp 引擎）。
+- 无头 `--serve` **没有启动弹窗**（`modal` 恒为 `null`）；那两道弹窗只属于 `--mcp` 开的编辑器。
+- 协议 1 在挂起命令时会回 `command_busy`；旧格式 `run` 则是直接顶掉。
+- 协议 1 的 `request_id` **必须每条唯一**，否则会被当重复请求拒掉。
+- `--serve` 首行有一句就绪横幅；`--serve --port N` 可走 TCP。
 - `set_properties` 要带 `collection`，颜色值是序列化枚举 `{"Index": n}` / `"ByLayer"`，
   给 `"Red"` 会回 `invalid_value`。
 - 需要 `HOME` / `XDG_CONFIG_HOME` 存在，否则报 `No user configuration directory`。
@@ -158,7 +181,7 @@ r = tools.capture("/tmp/v.png", commands=[...], if_changed=True)      # 画面�
 ## 已知限制 / 路线图
 
 - 预览器不展开 BLOCK/INSERT，遇到块引用里的实体只会统计到 `skipped`。
-- `TEXT`/`HATCH` 在无头 `run` 下是上游静默 no-op（值得给上游提 issue）。
+- `MTEXT`/`HATCH`/`POLYGON` 在批处理 `run` 下仍是静默空转（`TEXT` 已修）——已在上游 #1390 里留成设计问题。
 - 无头导出 PDF/PNG 上游未开放（`pdf_export.rs` 只被 GUI 调用）；本地渲染只是替代方案，
   真机有显示器时应优先用上游渲染器。
 - 给图纸上色：`ocads_set_properties`（mcp 引擎）改的是图纸数据；`ocads_preview` 的

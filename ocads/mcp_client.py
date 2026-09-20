@@ -311,6 +311,9 @@ class UpstreamMCP:
 
         第 4 步之后 ``state.command`` 会变成 null（命令结束了，编辑器开着），
         所以别拿"还有没有 command"判断成败——看实体里有没有 ``Text``。
+
+        注：``--serve`` 的旧格式 ``run`` 现在也能写文字了（上游已修），同样这套
+        start/input 步骤在 ``--serve`` 的**协议 1** 下也能用，不限于 ``--mcp``。
         """
         self.start_command("TEXT", document, session=session)
         self.input_point(at[0], at[1], document=document, session=session)

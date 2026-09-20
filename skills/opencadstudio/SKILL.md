@@ -12,7 +12,7 @@ description: 用 OpenCADStudio 生成、校验、导出和预览 CAD 图纸（DX
 
 | 引擎 | 用什么 | 强项 | 弱项 |
 |---|---|---|---|
-| `serve`（默认） | 上游 `--serve` JSON 行协议 | 快（一次连接跑完整批）、无窗口、稳 | **没有量测**、**没有原厂截图**、TEXT/HATCH 静默 no-op、不支持交互步骤 |
+| `serve`（默认） | 上游 `--serve` JSON 行协议，**两种请求格式**（旧格式 / 协议 1） | 快（一次连接跑完整批）、无窗口、稳；协议 1 下量测、命令清单、交互步骤全都能用 | 没有原厂截图（`capture` 回 `gui_required`） |
 | `mcp` | 上游 `--mcp`（GUI 控制面，无显示时自动套 `xvfb-run`） | **内核量测**、**原厂渲染截图**、`set_properties` 线上色、**TEXT 实测可建**（交互步骤）、FILLET/TRIM 这类交互命令 | 慢一些（每条一个往返）、要 xvfb/DISPLAY |
 
 起步自检：
@@ -29,10 +29,11 @@ ocads_info                     # 或：python3 -m ocads.tools info
 
 ### mcp 引擎的三个必知坑（都踩过，实测解法）
 
-1. **启动弹窗会挡住建图**：`AssocPrompt` → `DonationPrompt`，不清掉的话 `{"op":"new"}`
-   返回 ok 却建不出图纸（上游 issue #1349 描述过同一现象）。解法：`{"op":"action",
-   "name":"close_modal"}`（比发 `cancel`/Esc 精准）。本工具只自动关白名单里的
+1. **启动弹窗只属于 `--mcp` 这条**（它开的是真编辑器）：`AssocPrompt` → `DonationPrompt`，
+   不清掉的话 `{"op":"new"}` 返回 ok 却建不出图纸（issue #1349 同现象）。解法：
+   `{"op":"action","name":"close_modal"}`（比 `cancel`/Esc 精准）。本工具只自动关白名单里的
    `AssocPrompt / DonationPrompt / UpdateNotice / About`，其它弹窗**如实上报不代关**。
+   `--serve` 没有窗口，`modal` 恒为 `null`，**不需要这一步**。
 2. **读写都要带 `document_id`**：默认盯"活动标签页"，新建完活动页可能还停在开始页，
    不带 id 会读到空图纸。
 3. **`waiting_input` 不等于失败**：SPLINE/ARC 这类"还能继续吃输入"的命令、
@@ -50,7 +51,8 @@ ocads_info                     # 或：python3 -m ocads.tools info
 | 关键字（`J`/`ST`/`C`） | `{"op":"input","kind":"token","text":"C"}` | 负载字段名是 **text**，写成 `token` 会回 `Missing text for input` |
 | 回车 | `{"op":"input","kind":"enter"}` | 吃掉默认值 |
 
-**写文字（TEXT）的完整六步**（`run` 做不到，批处理里它是静默 no-op）：
+**写文字（TEXT）的交互六步**（旧格式 `run` 现在也能写了——上游已修；这条用于要精确控制、
+或要写 MTEXT 这类还没有等价便捷写法的场合。协议 1 下这些步骤在无头同样可用）：
 
 ```
 start  cmd=TEXT
@@ -64,6 +66,20 @@ action name=text_commit
 第 4 步之后 `state.command` 会变成 `null`——**别用"还有没有 command"判断成败**，
 去数实体里有没有 `Text`。本工具封装成 `mcp.add_text(...)`，返回 `texts` 计数。
 
+### `--serve` 的两条请求格式（务必分清）
+
+| | 旧格式 | 协议 1 |
+|---|---|---|
+| 长什么样 | `{"op":"run","cmd":"…"}` | `{"protocol":1,"request_id":"唯一串","document_id":N,"op":"…"}`（字段**平铺**） |
+| 底层 | 精简 op 集 | **控制面本身**（和 `--mcp` 同一套） |
+| 能做什么 | new/open/run/entities/query/records/layers/header/save… | 上面全部 + `measure`/`commands`/`properties`/`history`/`state` + `start`/`input`/`action` 交互步骤 |
+| 挂起命令时 | 新命令行**顶掉**挂起的命令 | 回 `command_busy`，要先 `cancel` |
+| 要 `document_id` 吗 | 不用 | 大多数要，否则 `document_required` |
+| 回复字段 | `status`/`added`/`unconsumed`/`blocked_by` | `ok`/`status`/`code`/`state`/`changes`/`result` |
+
+`--serve` 开跑第一行会先吐一句就绪横幅（`{"ok":true,"ready":true,"version":"…"}`），别把它当回复。
+另外 `--serve --port N` 可以走 TCP（本工具 `ServeSession(port=…)` 支持），行为一致。
+
 ## 1. 标准闭环（四步，缺一步就等于没做完）
 
 1. **生成**：`ocads_run`，命令按顺序给，一行一条**完整**命令，最后 `save_path` 落盘。
@@ -73,7 +89,8 @@ action name=text_commit
    - `op="query"` + `parameters={"type":"Circle","detail":"full"}` → 半径、圆心、bounds
    - `op="intersections"` + `parameters={"handles":["63","64"]}` → 真交点坐标（内核算的）
    - `op="near"` + `parameters={"point":[0,0]}` → 最近实体 + 距离
-   > 面积/长度那种 `measure` **无头模式没有**（GUI MCP 专属），别去试。
+   > 面积/长度/包围盒/质量特性用 `ocads_read(op="measure")` ——走**协议 1**，无头可用。
+   > 命令清单和批处理写法用 `ocads_read(op="commands")`，别再靠猜。
 4. **出图验收**：`ocads_preview` 出 PNG，看图（这一步是给人和给 AI 自己看的）。
 
 > 只跑第 1 步就汇报“画好了”，是不合格的。第 2、3 步是这套流程唯一比“让模型直接吐 DXF 文本”强的地方。
@@ -107,8 +124,8 @@ action name=text_commit
 
 | 想做的事 | 结论 |
 |---|---|
-| `TEXT` / `MTEXT` / `HATCH` / `POLYGON`（**serve 引擎**） | **静默 no-op**：返回 completed 但一个实体都不加。要文字就切 mcp 引擎用六步流程（见 §0 末）；HATCH/POLYGON 尚未验证 |
-| 面积 / 长度量测（`measure`） | 只有 mcp 引擎有（`--serve` 回 `unknown op: measure`）。用 `ocads_read(op="measure", engine="mcp", open_path=…)` 或 `ocads_run(engine="mcp")` 返回的 `measurements` |
+| `MTEXT` / `HATCH` / `POLYGON`（批处理 `run`） | 仍是**静默空转**（completed + added=0）：它们需要图案/边界这类交互面。`TEXT` 已经修好（旧格式 `run` 会写进画布编辑器并提交） |
+| 面积 / 长度量测（`measure`） | ✅ **无头可用**，走协议 1：`ocads_read(op="measure", open_path=…)`；不给句柄就用当前选区。注意**旧格式**发 `measure` 才会报 `unknown op` |
 | 交互式续行（先 `PLINE` 再一步步给点） | 不支持。`--serve` 每行都是独立完整命令；半截命令**不一定报错**（见下） |
 | 半截命令（缺参数） | 更坑：`LINE 0,0` 是静默不加实体；`CIRCLE 0,0`（缺半径）**照样 added=1**，造出一个退化圆。所以永远别信 `added`，要回读几何 |
 | 无头导出 PNG/PDF | `--export` 只认 `.dwg/.dxf`。要图：`ocads_capture`（mcp 引擎，**原厂渲染**）或 `ocads_preview`（serve 侧自绘，仅需 Pillow） |
@@ -136,7 +153,7 @@ action name=text_commit
 |---|---|---|
 | `ocads_info` | 环境自检 | — |
 | `ocads_run` | 跑命令、存图 | `commands[]`、`open_path`、`save_path` |
-| `ocads_read` | 回读校验 | `op` = entities/records/query/intersections/near/layers/header/capabilities；**`measure` 需 `engine="mcp"`** |
+| `ocads_read` | 回读校验 | 旧格式：entities/records/query/intersections/near/layers/header/capabilities；**协议 1**：measure/commands/properties/history/state |
 | `ocads_capture` | **原厂渲染**截图 | `png_path`、`commands`/`dxf_path`、`target`、`view`、`if_changed`+`threshold` |
 | `ocads_set_view` | 切视图（`home`/`extents`） | `name` |
 | `ocads_set_properties` | 真改实体属性（线上色/换图层） | `handle` + `updates=[{"path":"/common/color","value":"Red"}]` |
@@ -148,6 +165,11 @@ action name=text_commit
 注意这只影响渲染，不改文件。
 
 ## 5.1 同类实践（参考，别重复造）
+
+截至 2026-09-21：我们提的修复与这页 native 文档都已被上游合入（PR #1392 / #1401），
+维护者还重写了我们那页 `docs/automation/native.md`（他列出的错正是"把两条请求格式当成一套"、
+"以为无头没有 measure"、"以为一个连接一个实例"这几条）。**上游 `docs/automation/native.md`
+现在是权威说法**，本 skill 里的实测结论以它为准；有出入先信上游，再回来改这里。
 
 `helenkwok/ocs-webmcp`（MIT）把上游控制面接到浏览器 WebMCP（24 个工具、人工确认门、
 乐观并发、录制 contact sheet），跑的是 web 版。它验证了同一套控制面在浏览器里的边界，
@@ -168,7 +190,11 @@ action name=text_commit
 | `命令没走完就停在交互状态` | 把该命令的提示答案补齐（点/选项），或换命令行能一次完成的写法 |
 | `run` 返回 ok 但 `added=0` | 大概率撞上 no-op 命令（TEXT/HATCH/POLYGON），或命令缺参数被静默吞掉 |
 | 明明"成功"但几何不对（半径/位置离谱） | 缺参数的命令会退化成功：用 `op="query", detail="full"` 读真实 radius/center/bounds |
-| `unknown op: measure` | 无头没有这个能力，改用 intersections / near |
+| `unknown op: measure`（旧格式发 measure） | 改成协议 1：`ocads_read(op="measure")`，或直接用 `sess.measure(handles)` |
+| `command_busy` | 有交互命令没结束。协议 1 会拒绝新的 `run`/`start`；先 `cancel`，或用旧格式 `run`（它会顶掉挂起的命令） |
+| `document_required` | 协议 1 的操作几乎都要 `document_id`（先 `new`/`open` 拿，或读一次 `state`） |
+| `stale_state` | 修订号过期：先读一次 `state`（拿 revision/geometry_revision）再改 |
+| 请求发出去但行为不对、像没生效 | **`request_id` 必须每条唯一**：重复 id 会被当成重复请求拒掉 |
 | `open` 成功但 entities 为空 | 文件里实体在 BLOCK 里（预览器暂不支持块展开） |
 | 预览一片空白 | `scale` 太小或实体坐标跨度极大 → 调大 `scale` 或指定 `extents` |
 | 进程起不来 | 看 `drain_stderr` 内容；确认 `--serve` 可用（`ocads_info`） |

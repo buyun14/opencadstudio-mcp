@@ -24,8 +24,9 @@ __all__ = ["ToolError", "info", "run_commands", "read_document", "export",
 #: ``mcp`` = 上游 GUI MCP（Xvfb 下可用，有量测、原厂渲染、交互步骤）
 ENGINES = ("serve", "mcp")
 
-#: 无头 ``run`` 里被静默忽略的命令（实测：返回 completed 但 added=0）
-HEADLESS_NOOP = ("TEXT", "MTEXT", "HATCH", "BHATCH", "POLYGON", "-HATCH")
+#: 批处理 ``run`` 里仍然会静默空转的命令（2026.38.0 实测：返回 completed 但 added=0）。
+#: ``TEXT`` 曾在这份名单里，上游已修（旧格式 ``run`` 现在会把文字写进画布编辑器并提交）。
+HEADLESS_NOOP = ("MTEXT", "HATCH", "BHATCH", "POLYGON", "-HATCH")
 
 #: 本来就不产生新实体的命令，added=0 是正常的
 NON_CREATING = ("ERASE", "ZOOM", "PAN", "UNDO", "REDO", "SELECT", "REGEN", "PURGE",
@@ -81,8 +82,8 @@ def syntax_guard(commands: Iterable[str]) -> list[str]:
     for cmd in commands:
         head = cmd.strip().split(" ", 1)[0].upper()
         if head in HEADLESS_NOOP:
-            warns.append(f"{head} 在无头 run 里是静默 no-op（返回 completed 但不会加实体），"
-                         f"要文字/填充请走 GUI 或 MCP 的 start-step 流：{cmd!r}")
+            warns.append(f"{head} 在批处理 run 里仍是静默空转（返回 completed 但不会加实体），"
+                         f"它需要交互式界面（图案选择/边界选择）：{cmd!r}")
     return warns
 
 
@@ -143,46 +144,70 @@ def read_document(op: str = "entities", *, open_path: str | None = None,
                   timeout: float = 120.0) -> dict[str, Any]:
     """读图纸。
 
-    ``serve`` 引擎：entities / records / query / intersections / near / layers / header /
-    capabilities（``query`` 支持 type/layer/handles/near/contains_point/bounds/detail）。
-    ``mcp`` 引擎：以上读操作 + **measure**（内核算长度/面积/包围盒/质量特性）。
+    ``serve`` 引擎（默认，无需窗口）有两条通道：
 
-    ``measure`` 只在 mcp 引擎可用——``--serve`` 没有这个 op，会明确报错而不是返回空。
+    * **旧格式**（``{"op": ...}``）：``entities`` / ``records`` / ``query`` /
+      ``intersections`` / ``near`` / ``layers`` / ``header`` / ``capabilities``
+    * **协议 1**（``{"protocol":1, ...}``，走的和控制面同一套）：``measure``（内核算出的
+      长度/面积/包围盒/质量特性）、``commands``（命令清单，含批处理写法）、``properties``、
+      ``history``、``state``
+
+    ``capture`` 两者都没有：无窗口时它回 ``gui_required``，要截图请用 ``ocads_capture``
+    （mcp 引擎）。
     """
     op = (op or "entities").strip()
     params = dict(parameters or {})
     engine = (engine or "serve").lower()
     if engine not in ENGINES:
         raise ToolError(f"engine 只能是 {'/'.join(ENGINES)}")
-    serve_ops = ("entities", "layers", "header", "capabilities", "records", "query",
-                 "intersections", "near")
-    if op not in serve_ops and op != "measure":
-        raise ToolError(f"不支持的 op：{op}（可用 {'/'.join(serve_ops)}/measure）")
-    if op == "measure":
-        if engine != "mcp":
-            raise ToolError("measure（面积/长度）只有 GUI MCP 引擎有："
-                            "传 engine='mcp' 再试；--serve 引擎可改用 intersections / near")
-        limit = int(params.get("limit") or 20)
+    legacy = ("entities", "records", "query", "intersections", "near", "layers",
+              "header", "capabilities")
+    protocol_one = ("measure", "commands", "properties", "history", "state")
+    if op not in legacy + protocol_one:
+        raise ToolError(f"不支持的 op：{op}（可用 {'/'.join(legacy + protocol_one)}）")
+
+    if engine == "mcp":
         with _mcp.UpstreamMCP(timeout=timeout) as m:
             prep = m.prepare_document(document=params.get("document"))
+            sid, did = prep["session"], prep["document"]
             if open_path:
-                m.call("open", session=prep["session"], document=prep["document"],
+                m.call("open", session=sid, document=did,
                        path=resolve_path(open_path, must_exist=True))
-            handles = params.get("handles") or m.handles(prep["document"], session=prep["session"])[:limit]
-            if not handles:
-                raise ToolError("这份图纸里没有可量测的实体（measure 需要 handles，或先 open_path）")
-            return m.measure(handles, prep["document"], session=prep["session"])
+            if op == "measure":
+                handles = params.get("handles") or m.handles(did, session=sid)
+                handles = list(handles)[: int(params.get("limit") or 20)]
+                if not handles:
+                    raise ToolError("这份图纸里没有可量测的实体")
+                return m.measure(handles, did, session=sid)
+            if op == "commands":
+                args: dict[str, Any] = {"ocs_session_id": sid}
+                if params.get("name"):
+                    args["parameters"] = {"name": params["name"]}
+                return m.tool("ocs_read", args)
+            if op in ("records", "query"):
+                return m.read(op, session=sid, document=did,
+                              parameters=params or {"collection": "entities"})
+            return m.read(op, session=sid, document=did)
+
     with _client.ServeSession(timeout=timeout) as sess:
         if open_path:
             sess.open(resolve_path(open_path, must_exist=True))
-        else:
-            sess.new()
-        if op in ("entities", "layers", "header", "capabilities"):
-            return sess.request(op)
-        if op == "records":
-            return sess.records(**params)
-        if op == "query":
-            return sess.query(**params)
+        did = params.get("document")
+        if op == "commands":
+            return sess.command_manifest(params.get("name"))
+        if op in ("properties", "history", "state"):
+            return sess.control_must(op, document_id=did)
+        if op == "measure":                      # 协议 1：无头也能量
+            if did is None:
+                did = sess.control("state").get("document_id")
+            handles = params.get("handles")
+            if not handles:
+                recs = sess.control_must("records", document_id=did, collection="entities")
+                handles = [r["handle"] for r in recs.get("records", []) if r.get("handle")]
+            handles = list(handles)[: int(params.get("limit") or 20)]
+            if not handles:
+                raise ToolError("这份图纸里没有可量测的实体（也可以先选中再让 measure 用选区）")
+            return sess.measure(handles, did)
         if op == "intersections":
             handles = params.get("handles") or []
             if len(handles) != 2:
@@ -194,12 +219,14 @@ def read_document(op: str = "entities", *, open_path: str | None = None,
                 raise ToolError("near 需要 parameters.point = [x, y]")
             extra = {k: v for k, v in params.items() if k not in ("point", "near")}
             return sess.near(float(point[0]), float(point[1]), **extra)
-        raise ToolError(f"不支持的 op：{op}")
+        if op in ("records", "query"):
+            return sess.request(op, **params)
+        return sess.request(op)
 
 
 def _run_via_mcp(cmds: list[str], *, open_path: str | None, save_path: str | None,
                 capture_png: str | None, warnings: list[str], timeout: float) -> dict[str, Any]:
-    """走上游 GUI MCP 跑命令（顺带清弹窗、可选截图）。"""
+    """走上游 GUI MCP 跑命令：清弹窗 → 画 → 回读句柄 → 顺带内核量测/截图/存盘。"""
     with _mcp.UpstreamMCP(timeout=timeout) as m:
         prep = m.prepare_document()
         sid, did = prep["session"], prep["document"]
@@ -211,9 +238,10 @@ def _run_via_mcp(cmds: list[str], *, open_path: str | None, save_path: str | Non
         out: dict[str, Any] = {"engine": "mcp", "commands": len(cmds), "added": res["ok"],
                                "failed": res["failed"], "no_op": res["no_op"],
                                "waiting_input": res.get("waiting_input"),
-                               "warnings": warnings, "modals_closed": prep["modals"]["closed"],
-                               "modal_left": prep["modals"]["left"], "entities": len(handles),
-                               "handles": handles, "document": did}
+                               "warnings": warnings,
+                               "modals_closed": prep["modals"]["closed"],
+                               "modal_left": prep["modals"]["left"],
+                               "entities": len(handles), "handles": handles, "document": did}
         if handles:
             try:
                 out["measurements"] = m.measure(handles[:20], did, session=sid)
@@ -423,18 +451,21 @@ def tool_schemas() -> list[dict[str, Any]]:
         },
         {
             "name": "ocads_read",
-            "description": ("读图纸 / 验真：entities（实体清单）、records（完整记录+属性）、query（type/layer/handles/near/"
-                            "contains_point/bounds/detail）、intersections（两个句柄的内核真交点）、near（最近实体+距离）、"
-                            "layers、header、capabilities。注意：面积/长度类 measure 只在 GUI MCP 里有，无头不提供。"),
+            "description": ("读图纸 / 验真。serve 引擎：entities、records、query（type/layer/handles/near/"
+                            "contains_point/bounds/detail）、intersections（两实体内核真交点）、near（最近实体+距离）、"
+                            "layers、header、capabilities；协议 1 另加 measure（内核量测：长度/面积/包围盒/质量特性）、"
+                            "commands（命令清单+批处理写法）、properties、history、state。"
+                            "capture 在无窗口下回 gui_required，截图请用 ocads_capture。"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "op": {"type": "string", "enum": ["entities", "records", "query", "intersections",
-                                                      "near", "layers", "header", "capabilities"]},
+                                                      "near", "layers", "header", "capabilities",
+                                                      "measure", "commands", "properties", "history", "state"]},
                     "open_path": {"type": "string", "description": "可选：读这份文件（不给则读空图）"},
                     "parameters": {"type": "object", "description": "透传参数：records→{\"collection\":\"entities\"}；query→{\"type\":\"Circle\",\"detail\":\"full\"}；intersections→{\"handles\":[\"63\",\"64\"]}；near→{\"point\":[0,0]}；measure→{\"handles\":[\"63\"]}"},
                     "engine": {"type": "string", "enum": ["serve", "mcp"],
-                               "description": "measure 必须用 mcp；其余读操作 serve 即可"},
+                               "description": "两条都能量测；capture 只有 mcp 可行"},
                 },
                 "required": ["op"],
             },

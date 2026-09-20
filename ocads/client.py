@@ -70,6 +70,7 @@ class ServeSession:
         self.proc: subprocess.Popen | None = None
         self.sock: socket.socket | None = None
         self.ready: dict[str, Any] = {}
+        self._rid = 0
         self._start()
 
     # ---------------------------------------------------------------- 生命周期
@@ -152,8 +153,58 @@ class ServeSession:
             raise ServeError("等待 OpenCADStudio 响应超时") from exc
         return line.strip() if line else ""
 
+    def send(self, payload: dict) -> dict:
+        """发一个**原样**的请求体（协议 1 的字段是平铺的，不能套成 ``{"op": ...}``）。"""
+        try:
+            self._writer.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self._writer.flush()
+        except (BrokenPipeError, ValueError) as exc:
+            raise ServeError(f"通道已断：{self.drain_stderr()}") from exc
+        raw = self._readline()
+        if not raw:
+            raise ServeError(f"没有响应，进程可能已退出：{self.drain_stderr()}")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ServeError(f"响应不是 JSON：{raw[:200]}") from exc
+
+    def control(self, op: str, *, document_id: Any = None, client_id: str = "ocads",
+                **fields: Any) -> dict:
+        """协议 1：走**控制面**（和 ``--mcp`` 同一套操作），字段平铺。
+
+        这一层比旧 op 强：``measure``（内核量测）、``commands``（命令清单）、
+        ``records``/``properties``/``history``、``capture`` 都在这里。返回原样 dict，
+        失败判定用 ``ok``/``status``（``code`` 会是 ``command_busy`` /
+        ``document_required`` / ``gui_required`` / ``stale_state`` 这类）。
+        """
+        self._rid += 1
+        payload: dict[str, Any] = {"protocol": 1, "request_id": f"ocads-{self._rid}", "op": op}
+        if document_id is not None:
+            payload["document_id"] = document_id
+        if client_id:
+            payload["client_id"] = client_id
+        payload.update({k: v for k, v in fields.items() if v is not None})
+        return self.send(payload)
+
+    def control_must(self, op: str, **kwargs: Any) -> dict:
+        """同 ``control``，但失败就抛错，并把上游的 code 带在消息里。"""
+        res = self.control(op, **kwargs)
+        if not res.get("ok"):
+            code = res.get("code") or res.get("status") or "failed"
+            hint = ""
+            if code == "command_busy":
+                hint = "（有交互命令还没结束：先发 cancel 或用旧格式的 run 顶掉它）"
+            elif code == "document_required":
+                hint = "（这条操作必须带 document_id，先用 new/open 拿一个）"
+            elif code == "gui_required":
+                hint = "（无窗口环境做不了：capture 请走 mcp 引擎）"
+            elif code == "stale_state":
+                hint = "（修订号过期：先读一次 state 再改）"
+            raise ServeError(f"{op} 被拒：{code} - {res.get('error') or ''}{hint}")
+        return res
+
     def request(self, op: str, **params: Any) -> dict:
-        """发一条 op，返回响应 dict（不抛错，调用方自行判断 ``ok``）。"""
+        """发一条**旧格式** op（``{"op": ...}``），返回响应 dict（不抛错）。"""
         payload = {"op": op}
         payload.update({k: v for k, v in params.items() if v is not None})
         try:
@@ -209,14 +260,34 @@ class ServeSession:
     def entities(self) -> dict:
         return self.must("entities")
 
-    def query(self, **params: Any) -> dict:
-        """内核级查询：type/layer/handles/近邻/包含/包围盒/交点。
+    def new_document(self) -> int:
+        """协议 1 建新图，返回 document_id（无头下没有启动弹窗挡路）。"""
+        res = self.control_must("new")
+        state = res.get("state") or {}
+        did = state.get("document_id")
+        if did is None:
+            raise ServeError(f"new 没给出 document_id：{json.dumps(res, ensure_ascii=False)[:200]}")
+        return int(did)
 
-        ``--serve`` **没有** ``measure``（面积/长度）这个 op——那是 GUI MCP 专属。
-        无头下能做内核验真的是：
+    def measure(self, handles: Iterable[str], document_id: Any = None) -> dict:
+        """内核量测（长度/面积/包围盒/质量特性）——协议 1 提供，无头可用。"""
+        hs = list(handles)
+        if not hs:
+            raise ServeError("measure 至少要一个带坐标的句柄")
+        return self.control_must("measure", document_id=document_id, handles=hs)
+
+    def command_manifest(self, name: str | None = None) -> dict:
+        """命令清单（含批处理写法示例）——协议 1 提供，无头可用。"""
+        return self.control_must("commands", name=name)
+
+    def query(self, **params: Any) -> dict:
+        """旧格式的内核查询：type/layer/handles/近邻/包含/包围盒/交点。
+
         - ``query(intersections=[h1, h2])`` → 真交点 + 参数（cadkernel::geom2d::intersect）
         - ``query(near=[x, y])`` → 最近实体 + distance + 参数
         - ``query(detail="full")`` → 每个实体的 bounds 与完整属性
+
+        面积/长度这类量测不在这里：它属于**协议 1**，见 :meth:`measure`。
         """
         return self.must("query", **params)
 
@@ -260,7 +331,15 @@ def discover(binary: str | None = None, timeout: float = 30.0) -> dict:
     try:
         with ServeSession(binary=info["binary"], timeout=timeout) as s:
             info["headless"] = bool(s.ready.get("ready"))
-            info["capabilities"] = s.request("capabilities")
+            info["capabilities"] = s.request("capabilities")          # 旧格式
+            try:
+                # 协议 1 走的才是控制面：measure / commands / records 这些都在那儿
+                res = s.control("capabilities")
+                info["protocol_1"] = bool(res.get("ok"))
+                info["control_capabilities"] = (res.get("editor") or {}).get("capabilities") or res
+            except ServeError as exc:
+                info["protocol_1"] = False
+                info["protocol_1_error"] = str(exc)
     except ServeError as exc:
         info["error"] = str(exc)
     return info
